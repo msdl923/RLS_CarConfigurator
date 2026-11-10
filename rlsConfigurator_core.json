@@ -1,0 +1,5 @@
+{
+  "id": "rlsConfigurator_core",
+  "order": 1900,
+  "module": "rlsConfigurator/core"
+}

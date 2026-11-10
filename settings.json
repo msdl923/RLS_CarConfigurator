@@ -1,0 +1,70 @@
+{
+  "_comment": "RLS Configurator settings. Reload the career (or restart) after changing anything. Keys starting with _ are comments.",
+
+  "configuratorSurchargePct": 8,
+
+  "minConfigYear": 2000,
+  "excludedConfigTypes": ["Police", "Service", "Loaner", "Frame",
+                          "StreetKnights", "Hardcore", "dns", "joesjunkcar", "joesJunk", "joesJunkshell"],
+  "_motorsport": "Motorsport configs (Race/Rally/Drift/Drag) can be ordered but cost this extra surcharge on top.",
+  "motorsportConfigTypes": ["Race", "Rally", "Drift", "Drag"],
+  "motorsportSurchargePct": 15,
+  "_factoryLike": "Config types / name fragments (matched in key or name) listed with the factory configs under Petrol/Diesel/Electric instead of Custom.",
+  "factoryLikeConfigTypes": ["Factory", "Limited Production"],
+  "factoryLikeConfigPatterns": ["rennspecht"],
+  "_shops": "Brand factory stores are detected automatically on every map. Use these lists to add or exclude shop ids.",
+  "extraConfiguratorShops": [],
+  "excludedConfiguratorShops": [],
+  "allowedVehicleTypes": ["Car", "Truck"],
+  "excludedModels": [],
+  "excludedConfigPatterns": ["^rls_", "^npk_", "^sk_", "joes_junk", "used_and_abused", "noprep", "streetheat", "proturbo"],
+  "dedupeModelsByName": true,
+  "newestGenerationYears": 8,
+  "subModels": { "vivace": ["Vivace", "Tograc", "Ardente"] },
+  "subModelFallback": { "vivace": "Vivace" },
+
+  "_engineSwap": "Engine swap: \"*\" = all models, block single ones via engineSwapExcludedModels. Price = base config + value difference of the swapped parts (downgrades refund refundPct of the difference) + feePct conversion fee.",
+  "engineSwapModels": ["*"],
+  "engineSwapExcludedModels": [],
+  "energyBrandingSlotPatterns": ["branding", "badge", "emblem", "logo"],
+  "engineSwapFeePct": 5,
+  "engineSwapRefundPct": 50,
+  "_engineSwapValue": "Resale value of swapped cars = base value +/- part difference, without configurator surcharge and conversion fee, minus this discount in %.",
+  "engineSwapValueDiscountPct": 5,
+  "allowEnergyTypeSwap": true,
+  "energyChangeSlotPatterns": ["exhaust", "radiator", "intercooler", "gauges", "frunk"],
+  "drivetrainSlotPatterns": ["fueltank", "fuel_tank", "transfer_case", "differential", "driveshaft", "halfshaft", "max_rpm", "tacho", "gauges_rpm", "redline", "shifter", "pedal", "drivemode", "exhaust", "muffler"],
+  "exhaustBodySlotPatterns": ["bumper_r", "diffuser", "valance_r", "rear_valance"],
+  "_preferBaseExhaust": "true = keep the base car's exhaust where both cars share the slots, otherwise use the donor exhaust incl. rear bumper/diffuser.",
+  "preferBaseExhaust": true,
+  "_debugDump": "true = write diagnostic files (catalog, engines, last swap, order log) to the BeamNG user folder.",
+  "debugDump": false,
+
+  "deliveryTimeMultiplier": 1.0,
+  "deliveryTiers": [
+    { "id": "standard",
+      "label": { "de": "Standard", "en": "Standard" },
+      "description": { "de": "Normale Produktion und Auslieferung", "en": "Regular production and delivery" },
+      "seconds": 1800, "surchargePct": 0 },
+    { "id": "express",
+      "label": { "de": "Express", "en": "Express" },
+      "description": { "de": "Bevorzugte Produktion", "en": "Prioritised production" },
+      "seconds": 600, "surchargePct": 4 },
+    { "id": "priority",
+      "label": { "de": "Priorität", "en": "Priority" },
+      "description": { "de": "Sofort vom Band, Direktlieferung", "en": "Straight off the line, direct delivery" },
+      "seconds": 120, "surchargePct": 10 }
+  ],
+  "defaultDeliveryTier": "standard",
+
+  "convertFreightPickupToGarageDelivery": true,
+  "_fulfilment": "Default hand-over: \"garage\" (delivered to your garage, small fee) or \"pickup\" (free, collect it at the dealer's freight point).",
+  "defaultFulfilment": "garage",
+  "garageDeliveryFeePct": 1,
+  "garageDeliveryFeeMin": 250,
+  "garageDeliveryFeeMax": 2500,
+
+  "shopOverrides": {
+    "_example": { "includeModels": [], "excludeModels": [] }
+  }
+}
