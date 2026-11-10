@@ -1,5 +1,5 @@
 dist/
 *.zip
-rlsConfigurator_*.json
+/rlsConfigurator_*.json
 .DS_Store
 Thumbs.db
