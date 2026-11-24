@@ -9,7 +9,7 @@
 
 local M = {}
 
-local MOD_VERSION = "1.0.0"
+local MOD_VERSION = "1.2.3"
 local LOG_TAG = "rlsConfigurator"
 local SETTINGS_PATH = "/gameplay/rlsConfigurator/settings.json"
 local LISTING_TTL_SECONDS = 3600
@@ -18,6 +18,7 @@ local SHOP_ID_BASE = 9000000
 
 local settings = nil
 local shopIndex = nil       -- sellerId -> shop record (with models) ; built lazily
+local shopIndexLevel = nil  -- level the index was built for (dealer ids repeat across maps)
 local armedPaint = nil      -- pending paint injection for the next matching shop spawn
 local originalSpawnNewVehicle = nil
 local wrappedSpawnNewVehicle = nil
@@ -70,6 +71,12 @@ local STRINGS = {
     orderedPickup = "Dein %s ist bestellt (%s). Abholbereit am Frachtpunkt von %s in ca. %s.",
     pickupReady = "Dein %s ist abholbereit am Frachtpunkt von %s. Eine Route wurde gesetzt.",
     swapIncompatible = "Dieser Motor passt nicht in diese Ausführung.",
+    orderedPickupDealer = "Dein %s ist bestellt (%s). Abholbereit bei %s in ca. %s.",
+    pickupReadyDealer = "Dein %s ist abholbereit bei %s. Eine Route wurde gesetzt.",
+    routeSet = "Route zu deinem %s wurde gesetzt.",
+    routeFailed = "Für dieses Fahrzeug konnte keine Route gesetzt werden.",
+    redirected = "Dein %s wird in die Garage geliefert (%s). Verfügbar in ca. %s.",
+    redirectFailed = "Lieferung in die Garage nicht möglich (keine freie Garage?).",
   },
   en = {
     sec = "%d s", min = "%d min", hour = "%d h", hourMin = "%d h %d min",
@@ -85,6 +92,12 @@ local STRINGS = {
     orderedPickup = "Your %s has been ordered (%s). Ready for pickup at the %s freight point in about %s.",
     pickupReady = "Your %s is ready for pickup at the %s freight point. A route has been set.",
     swapIncompatible = "This engine does not fit this variant.",
+    orderedPickupDealer = "Your %s has been ordered (%s). Ready for pickup at %s in about %s.",
+    pickupReadyDealer = "Your %s is ready for pickup at %s. A route has been set.",
+    routeSet = "A route to your %s has been set.",
+    routeFailed = "No route could be set for this vehicle.",
+    redirected = "Your %s is being delivered to your garage (%s). Available in about %s.",
+    redirectFailed = "Garage delivery is not possible (no free garage?).",
   },
 }
 
@@ -142,6 +155,10 @@ local DEFAULT_SETTINGS = {
   factoryLikeConfigPatterns = {"rennspecht"},
   extraConfiguratorShops = {},
   excludedConfiguratorShops = {},
+  detectLocalBrandStores = true,
+  brandStoreMaxMileage = 160934,
+  brandStoreNamePatterns = {"online"},
+  localStoresAsOnline = true,
   allowedVehicleTypes = {"Car", "Truck"},
   excludedModels = {},
   excludedConfigPatterns = {"^rls_", "^npk_", "^sk_", "joes_junk", "used_and_abused", "noprep", "streetheat", "proturbo"},
@@ -173,6 +190,16 @@ local DEFAULT_SETTINGS = {
   garageDeliveryFeeMin = 250,
   garageDeliveryFeeMax = 2500,
   shopOverrides = {},
+  reputationSurchargeReduction = {["2"] = 2, ["3"] = 4, ["4"] = 6},
+  packagesEnabled = true,
+  packageRefundPct = 50,
+  packageCategories = {
+    {id = "wheels", label = {de = "Felgen & Reifen", en = "Wheels & tyres"},
+      slotPatterns = {"wheel_f", "wheel_r", "spacer_f", "spacer_r"}},
+    {id = "suspension", label = {de = "Fahrwerk", en = "Suspension"},
+      slotPatterns = {"coilover", "spring_f", "spring_r", "shock_f", "shock_r", "swaybar", "strut_f", "strut_r", "damper"}},
+  },
+  orderHistoryCount = 8,
 }
 
 local function loadSettings()
@@ -254,10 +281,32 @@ local function extraPctFor(cfg, donorCfg)
   return 0
 end
 
-local function finalPriceFor(basePrice, tier, extraPct)
-  local pct = (tonumber(getSettings().configuratorSurchargePct) or 0) + (tonumber(tier and tier.surchargePct) or 0)
-    + (tonumber(extraPct) or 0)
+-- surchargePct: effective configurator surcharge of the shop (after the reputation bonus); nil = setting.
+local function finalPriceFor(basePrice, tier, extraPct, surchargePct)
+  local surcharge = tonumber(surchargePct) or tonumber(getSettings().configuratorSurchargePct) or 0
+  local pct = surcharge + (tonumber(tier and tier.surchargePct) or 0) + (tonumber(extraPct) or 0)
   return ceilTo(basePrice * (1 + pct / 100), 100)
+end
+
+-- Dealer reputation (RLS organisation level) lowers the configurator surcharge:
+-- settings.reputationSurchargeReduction maps "minimum level" -> percentage points off.
+-- Returns effective surcharge %, reputation level, reduction in points.
+local function surchargeFor(shop)
+  local s = getSettings()
+  local baseSurcharge = tonumber(s.configuratorSurchargePct) or 0
+  local level = 0
+  local dealer = shop and overhaul_world_facilities and safeCall(overhaul_world_facilities.getDealership, shop.id)
+  local shopping = vehicleShopping()
+  local access = dealer and shopping and safeCall(shopping.getSellerAccessInfo, dealer)
+  if type(access) == "table" then level = tonumber(access.reputationLevel) or 0 end
+  local reduction = 0
+  if type(s.reputationSurchargeReduction) == "table" then
+    for minLevel, points in pairs(s.reputationSurchargeReduction) do
+      if level >= (tonumber(minLevel) or math.huge) then reduction = math.max(reduction, tonumber(points) or 0) end
+    end
+  end
+  reduction = math.min(reduction, baseSurcharge)
+  return baseSurcharge - reduction, level, reduction
 end
 
 -- Hand-over: pickup at the store's freight point is free, delivery to a garage costs a fee.
@@ -605,21 +654,78 @@ local function newestGeneration(record)
   return configs, newest
 end
 
--- Brand factory stores are recognised from the map's own facility data, so stores RLS adds on other
--- maps get the configurator automatically: a Brand filter plus factory/remanufactured sales channel or
--- online-only selling. settings.extraConfiguratorShops / excludedConfiguratorShops override by id.
+-- Brands (and explicitly listed models) of a dealer. Factory stores keep them in filter.whiteList;
+-- map packs like RLS Italy put them into subFilters instead ("Arima Online Dealership": empty main
+-- whitelist, one subFilter with Brand = Arima). Subfilter brands only count when every active
+-- subFilter is brand-bound, so a general dealer with one brand subFilter is not mistaken for a store.
+local function dealerBrandInfo(dealer)
+  local wl = dealer.filter and dealer.filter.whiteList or {}
+  local brands, models = {}, {}
+  local maxMileage = type(wl.Mileage) == "table" and tonumber(wl.Mileage.max) or nil
+  local function addAll(target, list)
+    if type(list) ~= "table" then return end
+    for _, v in ipairs(list) do
+      local seen = false
+      for _, w in ipairs(target) do if w == v then seen = true; break end end
+      if not seen then table.insert(target, v) end
+    end
+  end
+  addAll(brands, wl.Brand)
+  addAll(models, wl.model_key)
+  if not brands[1] and type(dealer.subFilters) == "table" then
+    local active, allBranded, subMax = 0, true, nil
+    for _, sub in ipairs(dealer.subFilters) do
+      if type(sub) == "table" and (tonumber(sub.probability) or 1) > 0 then
+        active = active + 1
+        local swl = type(sub.whiteList) == "table" and sub.whiteList or {}
+        if type(swl.Brand) ~= "table" or not swl.Brand[1] then allBranded = false end
+        local m = type(swl.Mileage) == "table" and tonumber(swl.Mileage.max) or nil
+        if m == nil then subMax = math.huge else subMax = math.max(subMax or 0, m) end
+      end
+    end
+    if active > 0 and allBranded then
+      for _, sub in ipairs(dealer.subFilters) do
+        if type(sub) == "table" and (tonumber(sub.probability) or 1) > 0 then
+          addAll(brands, sub.whiteList.Brand)
+          addAll(models, sub.whiteList.model_key)
+        end
+      end
+      if subMax and subMax ~= math.huge then maxMileage = maxMileage and math.min(maxMileage, subMax) or subMax end
+    end
+  end
+  return brands, models, maxMileage
+end
+
+-- Brand stores are recognised from the map's own facility data, so stores on other maps get the
+-- configurator automatically:
+--   * factory stores: Brand filter plus factory/remanufactured sales channel or online-only selling
+--   * local brand stores (e.g. the "Online Dealerships" on RLS Italy): Brand filter plus new-car
+--     mileage (<= brandStoreMaxMileage) or a name matching brandStoreNamePatterns.
+-- settings.extraConfiguratorShops / excludedConfiguratorShops override by id.
+-- Returns isShop, isLocal (local = sold through a normal dealer lot, not RLS's online channel).
 local function isBrandShop(dealer)
   if type(dealer) ~= "table" or type(dealer.id) ~= "string" then return false end
   local s = getSettings()
   for _, id in ipairs(s.excludedConfiguratorShops or {}) do
     if id == dealer.id then return false end
   end
-  local brands = dealer.filter and dealer.filter.whiteList and dealer.filter.whiteList.Brand
-  if type(brands) ~= "table" or not brands[1] then return false end
+  local brands, _, maxMileage = dealerBrandInfo(dealer)
+  if not brands[1] then return false end
+  local online = dealer.salesChannel == "factory" or dealer.salesChannel == "remanufactured" or dealer.remotePurchaseOnly == true
+  if online then return true, false end
   for _, id in ipairs(s.extraConfiguratorShops or {}) do
-    if id == dealer.id then return true end
+    if id == dealer.id then return true, true end
   end
-  return dealer.salesChannel == "factory" or dealer.salesChannel == "remanufactured" or dealer.remotePurchaseOnly == true
+  if s.detectLocalBrandStores == false then return false end
+  local limit = tonumber(s.brandStoreMaxMileage)
+  if limit and maxMileage and maxMileage <= limit then return true, true end
+  local haystack = string.lower(dealer.id .. " " .. tostring(dealer.name or ""))
+  for _, pattern in ipairs(s.brandStoreNamePatterns or {}) do
+    if type(pattern) == "string" and pattern ~= "" and string.find(haystack, string.lower(pattern), 1, true) then
+      return true, true
+    end
+  end
+  return false
 end
 
 local function buildShopIndex()
@@ -629,12 +735,15 @@ local function buildShopIndex()
 
   local shops, shopsByBrand, order = {}, {}, {}
   for _, dealer in ipairs(dealers) do
-    if isBrandShop(dealer) then
+    local isShop, isLocal = isBrandShop(dealer)
+    if isShop then
+      local brands, listedModels = dealerBrandInfo(dealer)
       local shop = {
         id = dealer.id,
         name = dealer.name or dealer.id,
-        brands = deepcopy(dealer.filter.whiteList.Brand),
-        whitelistModels = toSet(dealer.filter.whiteList.model_key),
+        brands = brands,
+        whitelistModels = toSet(listedModels),
+        localStore = isLocal == true,
         models = {},
       }
       shops[dealer.id] = shop
@@ -694,7 +803,7 @@ local function buildShopIndex()
     for _, model in ipairs(shop.models) do
       table.insert(summary, string.format("%s[%s, %d configs, bis %d]", model.name, model.model_key, #model.configs, model.maxYear))
     end
-    logI("shop %s (%s): %s", shop.id, table.concat(shop.brands, "/"), #summary > 0 and table.concat(summary, ", ") or "keine Modelle")
+    logI("shop %s (%s%s): %s", shop.id, table.concat(shop.brands, "/"), shop.localStore and ", local" or "", #summary > 0 and table.concat(summary, ", ") or "keine Modelle")
   end
 
   -- Brands with current models but without any factory store (candidates for new stores).
@@ -716,11 +825,13 @@ local function buildShopIndex()
 
   -- Facilities may not be loaded yet; do not cache an empty index.
   shopIndex = next(shops) ~= nil and shops or nil
+  shopIndexLevel = shopIndex and getCurrentLevelIdentifier() or nil
   return shops
 end
 
 local function getShop(sellerId)
   if type(sellerId) ~= "string" or sellerId == "" then return nil end
+  if shopIndex and shopIndexLevel ~= getCurrentLevelIdentifier() then shopIndex = nil end
   local index = shopIndex or buildShopIndex()
   return index[sellerId]
 end
@@ -846,6 +957,41 @@ end
 local swapEnabledFor -- defined with the engine swap code below
 local swapCompatibilityFor -- defined with the engine swap code below
 
+-- Info sheet ("i" button): in-game description and the performance data BeamNG stores per config.
+-- Descriptions may be translation keys; translate them when the game offers a translator.
+local function translated(text)
+  if type(text) ~= "string" or text == "" then return nil end
+  if not string.find(text, " ", 1, true) and string.find(text, ".", 1, true) and type(translateLanguage) == "function" then
+    local ok, value = pcall(translateLanguage, text, text, true)
+    if ok and type(value) == "string" and value ~= "" then text = value end
+  end
+  return text
+end
+
+local DETAIL_FIELDS = {
+  {"0-100 km/h", "accel100"}, {"0-60 mph", "accel60"}, {"Top Speed", "topSpeed"},
+  {"100-0 km/h", "brake100"}, {"Braking G", "brakingG"}, {"Off-Road Score", "offRoad"},
+  {"Weight/Power", "weightPower"}, {"Propulsion", "propulsion"}, {"Country", "country"},
+  {"Induction Type", "induction"}, {"PowerPeakRPM", "powerRpm"}, {"TorquePeakRPM", "torqueRpm"},
+}
+
+local function configDetailsFor(cfg)
+  local info = type(cfg.info) == "table" and cfg.info or {}
+  local details = {description = translated(info.Description)}
+  for _, field in ipairs(DETAIL_FIELDS) do
+    local value = info[field[1]]
+    if value == nil then value = firstAttr(info, field[1]) end
+    if type(value) == "number" or type(value) == "string" then details[field[2]] = value end
+  end
+  return details
+end
+
+local function modelDescriptionFor(modelKey)
+  local modelData = getModelData(modelKey)
+  local modelInfo = modelData and modelData.model or {}
+  return translated(modelInfo.Description or modelInfo.description)
+end
+
 local function catalogForUi(shop)
   local s = getSettings()
   local tiers = {}
@@ -860,6 +1006,7 @@ local function catalogForUi(shop)
     })
   end
   local defaultTier = getTier(s.defaultDeliveryTier)
+  local surcharge, repLevel, repReduction = surchargeFor(shop)
   local models = {}
   for _, model in ipairs(shop.models) do
     local configs, minPrice = {}, nil
@@ -885,8 +1032,9 @@ local function catalogForUi(shop)
         engineSlot = engine and engine.slot or nil,
         engineLabel = engineLabelFor(cfg, engine),
         basePrice = base,
+        details = configDetailsFor(cfg),
       })
-      local price = finalPriceFor(base, defaultTier, extraPctFor(cfg))
+      local price = finalPriceFor(base, defaultTier, extraPctFor(cfg), surcharge)
       minPrice = minPrice and math.min(minPrice, price) or price
     end
     table.insert(models, {
@@ -899,14 +1047,18 @@ local function catalogForUi(shop)
       fromPrice = minPrice,
       configs = configs,
       paints = paintsForModel(model.model_key),
+      description = modelDescriptionFor(model.model_key),
     })
   end
   return {
     lang = getLang(),
     sellerId = shop.id,
     shopName = shop.name,
+    localStore = shop.localStore == true,
     brands = shop.brands,
-    surchargePct = tonumber(s.configuratorSurchargePct) or 0,
+    surchargePct = surcharge,
+    reputation = {level = repLevel, reductionPct = repReduction, baseSurchargePct = tonumber(s.configuratorSurchargePct) or 0},
+    packagesEnabled = s.packagesEnabled ~= false,
     motorsport = {types = s.motorsportConfigTypes or {}, surchargePct = tonumber(s.motorsportSurchargePct) or 0},
     fulfilment = {
       default = normalizeFulfilment(nil),
@@ -962,7 +1114,7 @@ local function makeSpawnWrapper(original)
         and os.time() <= armed.expires then
       if type(armed.config) == "table" then
         options.config = deepcopy(armed.config)
-        logI("engine swap: spawning %s/%s with %s", model, tostring(armed.key), tostring(armed.donorKey))
+        logI("custom build: spawning %s/%s (engine from %s)", model, tostring(armed.key), tostring(armed.donorKey or "factory"))
       end
       if armed.paintNames then
         local ok, injected = pcall(injectPaint, options, model, armed.paintNames)
@@ -1002,6 +1154,30 @@ local function generateShopId()
     if not shopping.getVehicleInfoByShopId(id) then return id end
   end
   return SHOP_ID_BASE + math.random(0, 999999)
+end
+
+-- Local brand stores (RLS Italy "Online Dealerships") have no reachable door on the map, so they are
+-- only opened from a computer. RLS sells such "local" dealers remotely only from reputation level 2 and
+-- then needs a door as delivery origin. While a configurator order of such a store is open, the dealer
+-- is treated as an online/factory store (remote checkout, freight point = its parking spot); the
+-- original sales channel is restored right after the purchase or when the order is abandoned.
+local channelOverride = nil
+
+local function restoreDealerChannel()
+  if not channelOverride then return end
+  local dealer = channelOverride.dealer
+  if type(dealer) == "table" then dealer.salesChannel = channelOverride.salesChannel end
+  logI("restored sales channel of %s", tostring(channelOverride.id))
+  channelOverride = nil
+end
+
+local function overrideDealerChannel(dealer)
+  restoreDealerChannel()
+  if type(dealer) ~= "table" or dealer.salesChannel == "factory" or dealer.salesChannel == "remanufactured"
+      or dealer.remotePurchaseOnly then return end
+  channelOverride = {dealer = dealer, id = dealer.id, salesChannel = dealer.salesChannel}
+  dealer.salesChannel = "factory"
+  logI("treating local brand store %s as online store for this order", tostring(dealer.id))
 end
 
 local function removeConfiguratorListings(keepShopId)
@@ -1414,10 +1590,237 @@ local function findConfigAnyRecord(shop, modelKey, configKey)
   return nil
 end
 
-local function buildListing(shop, dealer, model, cfg, paintName, tier, donorCfg, swapDelta, donorModel, fulfilment)
+-- Equipment packages (wheels, suspension) ------------------------------------------------------------
+-- A package takes the parts of one category (all slots matching its slotPatterns plus everything that
+-- hangs off them, e.g. tyres and hubcaps below a wheel) from another config of the same model line.
+-- Offered only when both cars use the same slots there, so the parts really fit. Price = part value
+-- difference (jbeam values, downgrades refund packageRefundPct).
+local packageCache = {}
+
+local function readPcParts(modelKey, configKey)
+  local data = jsonReadFile("/vehicles/" .. modelKey .. "/" .. configKey .. ".pc")
+  if type(data) ~= "table" then return nil end
+  local parts = data.parts or data.slotMap
+  if type(parts) ~= "table" then return nil end
+  return data, parts
+end
+
+local function packageCategory(id)
+  for _, cat in ipairs(getSettings().packageCategories or {}) do
+    if type(cat) == "table" and cat.id == id then return cat end
+  end
+  return nil
+end
+
+local function matchedSlots(parts, patterns)
+  local roots = {}
+  for slot in pairs(parts) do
+    local lower = string.lower(slot)
+    for _, pattern in ipairs(patterns or {}) do
+      if string.find(lower, string.lower(pattern), 1, true) then roots[slot] = true; break end
+    end
+  end
+  return roots
+end
+
+local function packageTree(ctx, jbeamIO, parts, roots)
+  local tree = {}
+  for slot in pairs(roots) do collectSubtree(ctx, jbeamIO, parts, slot, tree) end
+  return tree
+end
+
+local function partsSignature(parts, tree)
+  local list = {}
+  for slot in pairs(tree) do
+    local part = parts[slot]
+    if type(part) == "string" and part ~= "" then table.insert(list, slot .. "=" .. part) end
+  end
+  table.sort(list)
+  return table.concat(list, ";")
+end
+
+local function packageRefund(delta)
+  local refund = (tonumber(getSettings().packageRefundPct) or 0) / 100
+  return delta > 0 and delta or delta * refund
+end
+
+local function packagePriceFor(delta)
+  return ceilTo(packageRefund(delta) * buyMultiplier(), 10)
+end
+
+-- Part name shown for an option: jbeam name of the first front part of the category.
+local function packageLabel(ctx, jbeamIO, parts, roots)
+  local slots = {}
+  for slot in pairs(roots) do
+    if type(parts[slot]) == "string" and parts[slot] ~= "" then table.insert(slots, slot) end
+  end
+  table.sort(slots, function(a, b)
+    local fa = string.find(string.lower(a), "_f", 1, true) and 0 or 1
+    local fb = string.find(string.lower(b), "_f", 1, true) and 0 or 1
+    if fa ~= fb then return fa < fb end
+    return a < b
+  end)
+  for _, slot in ipairs(slots) do
+    local part = getPartIn(ctx, jbeamIO, parts[slot])
+    local name = part and part.information and part.information.name
+    if type(name) == "string" and name ~= "" then return name end
+  end
+  return nil
+end
+
+-- Options of all categories for one base config: {categoryId -> {option, ...}}.
+local function packageOptionsFor(record, baseCfg)
+  local s = getSettings()
+  if s.packagesEnabled == false or not record or not baseCfg then return {} end
+  local modelKey = record.model_key
+  local cacheKey = tostring(record.id) .. "/" .. baseCfg.key
+  if packageCache[cacheKey] then return packageCache[cacheKey] end
+  local result = {}
+  local baseData, baseParts = readPcParts(modelKey, baseCfg.key)
+  local ctx, jbeamIO = jbeamCtxFor(modelKey)
+  if not baseParts or not ctx then packageCache[cacheKey] = result; return result end
+  for _, cat in ipairs(s.packageCategories or {}) do
+    if type(cat) == "table" and type(cat.id) == "string" then
+      local baseRoots = matchedSlots(baseParts, cat.slotPatterns)
+      local baseTree = packageTree(ctx, jbeamIO, baseParts, baseRoots)
+      local baseSig = partsSignature(baseParts, baseTree)
+      local options, seen = {}, {[baseSig] = true}
+      if next(baseRoots) then
+        for _, donor in ipairs(record.configs or {}) do
+          if donor.key ~= baseCfg.key then
+            local _, donorParts = readPcParts(modelKey, donor.key)
+            if donorParts then
+              local donorRoots = matchedSlots(donorParts, cat.slotPatterns)
+              local sameSlots = next(donorRoots) ~= nil
+              for slot in pairs(donorRoots) do if baseParts[slot] == nil then sameSlots = false; break end end
+              if sameSlots then
+                for slot in pairs(baseRoots) do if donorParts[slot] == nil then sameSlots = false; break end end
+              end
+              if sameSlots then
+                local donorTree = packageTree(ctx, jbeamIO, donorParts, donorRoots)
+                local sig = partsSignature(donorParts, donorTree)
+                if not seen[sig] then
+                  seen[sig] = true
+                  local added, removed = 0, 0
+                  for slot in pairs(donorTree) do
+                    local part = donorParts[slot]
+                    if type(part) == "string" and part ~= "" then added = added + partValueIn(ctx, jbeamIO, part) end
+                  end
+                  for slot in pairs(baseTree) do
+                    local part = baseParts[slot]
+                    if type(part) == "string" and part ~= "" then removed = removed + partValueIn(ctx, jbeamIO, part) end
+                  end
+                  local delta = added - removed
+                  table.insert(options, {
+                    category = cat.id,
+                    donorKey = donor.key,
+                    sourceName = donor.name,
+                    label = packageLabel(ctx, jbeamIO, donorParts, donorRoots) or donor.name,
+                    partValueDelta = delta,
+                    price = packagePriceFor(delta),
+                  })
+                end
+              end
+            end
+          end
+        end
+      end
+      table.sort(options, function(a, b) return a.price < b.price end)
+      if #options > 0 then
+        result[cat.id] = {
+          id = cat.id,
+          label = localized(cat.label) or cat.id,
+          currentLabel = packageLabel(ctx, jbeamIO, baseParts, baseRoots),
+          options = options,
+        }
+      end
+    end
+  end
+  packageCache[cacheKey] = result
+  return result
+end
+
+-- Applies chosen packages to a config table (parts + vars) in place. Returns total part value delta.
+local function applyPackages(config, record, baseCfg, chosen)
+  local options = packageOptionsFor(record, baseCfg)
+  local modelKey = record.model_key
+  local ctx, jbeamIO = jbeamCtxFor(modelKey)
+  local _, baseParts = readPcParts(modelKey, baseCfg.key)
+  local totalDelta, applied = 0, {}
+  if not ctx or not baseParts then return 0, applied end
+  config.parts = config.parts or {}
+  config.vars = config.vars or {}
+  for _, choice in ipairs(chosen or {}) do
+    local catOptions = options[choice.category]
+    local option
+    for _, o in ipairs(catOptions and catOptions.options or {}) do
+      if o.donorKey == choice.donorKey then option = o; break end
+    end
+    local cat = packageCategory(choice.category)
+    local donorData, donorParts = readPcParts(modelKey, choice.donorKey or "")
+    if option and cat and donorParts then
+      local baseTree = packageTree(ctx, jbeamIO, baseParts, matchedSlots(baseParts, cat.slotPatterns))
+      local donorTree = packageTree(ctx, jbeamIO, donorParts, matchedSlots(donorParts, cat.slotPatterns))
+      for slot in pairs(baseTree) do config.parts[slot] = nil end
+      for slot in pairs(donorTree) do
+        if donorParts[slot] ~= nil then config.parts[slot] = donorParts[slot] end
+      end
+      -- Tuning variables of the new parts (ride height, spring rates ...) that the base car lacks.
+      for key, value in pairs(type(donorData.vars) == "table" and donorData.vars or {}) do
+        if config.vars[key] == nil then config.vars[key] = value end
+      end
+      totalDelta = totalDelta + option.partValueDelta
+      table.insert(applied, {category = cat.id, categoryLabel = localized(cat.label) or cat.id,
+        donorKey = option.donorKey, label = option.label, sourceName = option.sourceName,
+        price = option.price, partValueDelta = option.partValueDelta})
+    else
+      logW("package %s/%s not available for %s", tostring(choice.category), tostring(choice.donorKey), baseCfg.key)
+    end
+  end
+  return totalDelta, applied
+end
+
+local function baseConfigFor(modelKey, cfg)
+  local data = readPcParts(modelKey, cfg.key)
+  if type(data) ~= "table" then return nil end
+  local config = deepcopy(data)
+  config.parts = deepcopy(data.parts or data.slotMap or {})
+  config.slotMap = nil
+  config.vars = deepcopy(data.vars or {})
+  config.partConfigFilename = "vehicles/" .. modelKey .. "/" .. cfg.key .. ".pc"
+  config.model = modelKey
+  return config
+end
+
+function M.requestPackages(sellerId, recordId, configKey)
+  local result = {sellerId = sellerId, recordId = recordId, key = configKey, categories = {}}
+  local ok, err = pcall(function()
+    local shop = getShop(sellerId)
+    if not shop then return end
+    for _, model in ipairs(shop.models) do
+      if (model.id or model.model_key) == recordId then
+        for _, cfg in ipairs(model.configs) do
+          if cfg.key == configKey then
+            local options = packageOptionsFor(model, cfg)
+            for _, cat in ipairs(getSettings().packageCategories or {}) do
+              if type(cat) == "table" and options[cat.id] then table.insert(result.categories, options[cat.id]) end
+            end
+            return
+          end
+        end
+      end
+    end
+  end)
+  if not ok then logE("requestPackages failed: %s", tostring(err)) end
+  guihooks.trigger("RlsConfiguratorPackages", result)
+end
+
+local function buildListing(shop, dealer, model, cfg, paintName, tier, donorCfg, swapDelta, donorModel, fulfilment, packagePrice)
   local listing = deepcopy(cfg.info)
   local base = donorCfg and swapPriceFor(cfg, swapDelta or 0) or basePriceFor(cfg.catalogValue)
-  local price = finalPriceFor(base, tier, extraPctFor(cfg, donorCfg))
+  base = base + (tonumber(packagePrice) or 0)
+  local surcharge = surchargeFor(shop)
+  local price = finalPriceFor(base, tier, extraPctFor(cfg, donorCfg), surcharge)
   local deliveryFee = fulfilment == "garage" and garageDeliveryFeeFor(price) or 0
   price = price + deliveryFee
   if donorCfg then
@@ -1446,10 +1849,10 @@ local function buildListing(shop, dealer, model, cfg, paintName, tier, donorCfg,
 
   listing.sellerId = shop.id
   listing.sellerName = dealer.name or shop.name
-  listing.salesChannel = dealer.salesChannel or "factory"
+  local access = safeCall(vehicleShopping().getSellerAccessInfo, dealer) or {}
+  listing.salesChannel = dealer.salesChannel or (shop.localStore and access.salesChannel) or "factory"
   listing.associatedOrganization = dealer.associatedOrganization
 
-  local access = safeCall(vehicleShopping().getSellerAccessInfo, dealer) or {}
   listing.remotePurchaseAllowed = access.remotePurchaseAllowed
   listing.garageDeliveryAllowed = access.garageDeliveryAllowed
   listing.deliveryDiscount = access.deliveryDiscount
@@ -1475,10 +1878,11 @@ local function buildListing(shop, dealer, model, cfg, paintName, tier, donorCfg,
     fulfilment = fulfilment,
     deliveryFee = deliveryFee,
     sellerName = dealer.name or shop.name,
+    baseConfigName = cfg.name,
+    localStore = shop.localStore == true,
     deliverySeconds = tierSeconds(tier),
     basePrice = base,
-    surchargePct = (tonumber(getSettings().configuratorSurchargePct) or 0) + (tonumber(tier.surchargePct) or 0)
-      + extraPctFor(cfg, donorCfg),
+    surchargePct = surcharge + (tonumber(tier.surchargePct) or 0) + extraPctFor(cfg, donorCfg),
     orderedAt = os.time(),
   }
   return listing
@@ -1551,7 +1955,7 @@ function M.requestSwapQuotes(sellerId, baseModel, baseKey, donorsJson)
   guihooks.trigger("RlsConfiguratorSwapQuotes", result)
 end
 
-local function placeOrderInternal(sellerId, modelKey, configKey, paintName, tierId, donorKey, donorModel, fulfilment)
+local function placeOrderInternal(sellerId, modelKey, configKey, paintName, tierId, donorKey, donorModel, fulfilment, packagesJson)
   local shopping = vehicleShopping()
   if not shopping then return false, T("shoppingUnavailable") end
   local shop = getShop(sellerId)
@@ -1588,10 +1992,37 @@ local function placeOrderInternal(sellerId, modelKey, configKey, paintName, tier
     donorCfg, swappedConfig, swapDelta = donor, config, delta
   end
 
+  -- Packages: applied on top of the (swapped) config; prices recomputed here, never taken from the UI.
+  local chosenPackages = type(packagesJson) == "string" and packagesJson ~= "" and jsonDecode(packagesJson) or nil
+  local finalConfig = swappedConfig
+  local packageDelta, appliedPackages = 0, {}
+  if type(chosenPackages) == "table" and chosenPackages[1] and getSettings().packagesEnabled ~= false then
+    finalConfig = finalConfig or baseConfigFor(modelKey, cfg)
+    if not finalConfig then return false, T("configNotFound") end
+    packageDelta, appliedPackages = applyPackages(finalConfig, model, cfg, chosenPackages)
+    if #appliedPackages == 0 and not swappedConfig then finalConfig = nil end
+  end
+  local packagePrice = 0
+  for _, pkg in ipairs(appliedPackages) do packagePrice = packagePrice + pkg.price end
+
   local tier = getTier(tierId)
   removeConfiguratorListings(nil)
+  restoreDealerChannel()
+  if shop.localStore and getSettings().localStoresAsOnline ~= false then overrideDealerChannel(dealer) end
   fulfilment = normalizeFulfilment(fulfilment)
-  local listing = buildListing(shop, dealer, model, cfg, paintName, tier, donorCfg, swapDelta, donorModel, fulfilment)
+  local listing = buildListing(shop, dealer, model, cfg, paintName, tier, donorCfg, swapDelta, donorModel, fulfilment, packagePrice)
+  if #appliedPackages > 0 then
+    listing.rlsConfigurator.packages = appliedPackages
+    local names = {}
+    for _, pkg in ipairs(appliedPackages) do table.insert(names, pkg.label) end
+    listing.Configuration = tostring(listing.Configuration or cfg.name) .. " · " .. table.concat(names, " · ")
+  end
+  if donorCfg or #appliedPackages > 0 then
+    -- Resale value base of what was actually built (catalog units), see onOverhaulVehicleAddedToInventory.
+    local discount = math.max(0, math.min(100, tonumber(getSettings().engineSwapValueDiscountPct) or 0))
+    local delta = (donorCfg and swapDeltaWithRefund(swapDelta or 0) or 0) + packageRefund(packageDelta)
+    listing.rlsConfigurator.catalogValue = math.max(0, math.floor((cfg.catalogValue + delta) * (1 - discount / 100) + 0.5))
+  end
   if donorCfg then
     listing.rlsConfigurator.swap = {
       donorModel = donorModel,
@@ -1603,34 +2034,34 @@ local function placeOrderInternal(sellerId, modelKey, configKey, paintName, tier
   end
   table.insert(shopping.getVehiclesInShop(), listing)
 
-  if (paintName or swappedConfig) and installSpawnWrapper() then
+  if (paintName or finalConfig) and installSpawnWrapper() then
     armedPaint = {
       model_key = modelKey,
       key = configKey,
       paintNames = paintName and listing.rlsConfigurator.paintNames or nil,
-      config = swappedConfig,
+      config = finalConfig,
       donorKey = donorCfg and donorCfg.key or nil,
       expires = os.time() + PAINT_ARM_SECONDS,
       shopId = listing.shopId,
     }
-    if swappedConfig and listing.rlsConfigurator.paintNames then
+    if finalConfig and listing.rlsConfigurator.paintNames then
       -- Keep the chosen paint inside the swapped config as well.
       local modelData = getModelData(modelKey)
       local modelPaints = modelData and modelData.model and modelData.model.paints
       if type(modelPaints) == "table" and modelPaints[paintName] then
-        swappedConfig.paints = {deepcopy(modelPaints[paintName]), deepcopy(modelPaints[paintName]), deepcopy(modelPaints[paintName])}
+        finalConfig.paints = {deepcopy(modelPaints[paintName]), deepcopy(modelPaints[paintName]), deepcopy(modelPaints[paintName])}
       end
     end
   end
 
-  logI("order %s %s/%s paint=%s tier=%s price=%d shopId=%d", sellerId, modelKey, configKey,
-    tostring(paintName), tostring(tier.id), listing.Value, listing.shopId)
+  logI("order %s %s/%s paint=%s tier=%s packages=%d price=%d shopId=%d", sellerId, modelKey, configKey,
+    tostring(paintName), tostring(tier.id), #appliedPackages, listing.Value, listing.shopId)
   shopping.openPurchaseMenu("instant", listing.shopId)
   return true
 end
 
-function M.placeOrder(sellerId, modelKey, configKey, paintName, tierId, donorKey, donorModel, fulfilment)
-  local ok, result, message = pcall(placeOrderInternal, sellerId, modelKey, configKey, paintName, tierId, donorKey, donorModel, fulfilment)
+function M.placeOrder(sellerId, modelKey, configKey, paintName, tierId, donorKey, donorModel, fulfilment, packagesJson)
+  local ok, result, message = pcall(placeOrderInternal, sellerId, modelKey, configKey, paintName, tierId, donorKey, donorModel, fulfilment, packagesJson)
   if not ok then
     logE("placeOrder failed: %s", tostring(result))
     sendOrderResult(false, T("orderFailedLog"))
@@ -1646,6 +2077,7 @@ end
 function M.reloadCatalog()
   loadSettings()
   shopIndex = nil
+  packageCache = {}
   buildShopIndex()
 end
 
@@ -1683,6 +2115,7 @@ function M.onOverhaulVehicleAddedToInventory(data)
   local order = type(info) == "table" and info.rlsConfigurator
   if type(order) ~= "table" then return end
   armedPaint = nil
+  restoreDealerChannel()
 
   local inv = inventory()
   local inventoryId = data.inventoryId
@@ -1697,26 +2130,38 @@ function M.onOverhaulVehicleAddedToInventory(data)
   -- RLS values inventory cars from the base config's catalog value; a swapped car gets the value of
   -- what was actually built instead (see swapCatalogValueFor).
   local valueBefore = record.configBaseValue
-  if type(order.swap) == "table" and tonumber(order.swap.catalogValue) then
-    record.configBaseValue = order.swap.catalogValue
-    logI("swap value: configBaseValue %s -> %s", tostring(valueBefore), tostring(record.configBaseValue))
+  local builtValue = tonumber(order.catalogValue) or (type(order.swap) == "table" and tonumber(order.swap.catalogValue)) or nil
+  if builtValue then
+    record.configBaseValue = builtValue
+    logI("custom build value: configBaseValue %s -> %s", tostring(valueBefore), tostring(record.configBaseValue))
   end
   pcall(appendOrderLog, {
     time = os.date("%Y-%m-%d %H:%M:%S"),
     inventoryId = inventoryId,
     model = info.model_key, config = info.key, name = info.Configuration,
     paint = order.paintName, tier = order.tierId, price = info.Value,
-    swap = order.swap,
+    swap = order.swap, packages = order.packages,
     configBaseValueBefore = valueBefore, configBaseValueAfter = record.configBaseValue,
   })
 
   local atFreight = type(record.location) == "string" and string.find(record.location, "^freightPickup") ~= nil
+  if order.localStore and not atFreight and safeCall(inv.getVehicleIdFromInventoryId, inventoryId) then
+    -- Local brand store (e.g. RLS Italy online dealerships): RLS put the car straight onto the dealer
+    -- lot. A built-to-order car is not there yet, so park it on RLS's pickup state like an online order.
+    local garage = safeCall(inv.getClosestOwnedGarageWithSpace)
+    record.location = "freightPickup:" .. tostring(info.sellerId)
+    record.niceLocation = order.sellerName or "Freight Pickup"
+    record.lastKnownLevel = getCurrentLevelIdentifier()
+    record.freightHomeGarageId = type(garage) == "table" and garage.id or nil
+    atFreight = true
+    logI("local store order %s: moved from dealer lot to pickup state", tostring(inventoryId))
+  end
   local pickup = order.fulfilment == "pickup"
   if pickup and atFreight then
     -- The car is still being built: take it off the freight point, it re-appears there when the
     -- delivery time is over (see updatePickups).
     safeCall(inv.removeVehicleObject, inventoryId)
-    record.rlsConfiguratorPickup = {sellerId = info.sellerId, sellerName = order.sellerName}
+    record.rlsConfiguratorPickup = {sellerId = info.sellerId, sellerName = order.sellerName, atDealer = order.localStore == true}
     if core_groundMarkers and core_groundMarkers.setPath then pcall(core_groundMarkers.setPath, nil) end
   elseif pickup then
     pickup = false -- RLS delivered to a garage itself (dealer reputation level 2+)
@@ -1740,9 +2185,30 @@ function M.onOverhaulVehicleAddedToInventory(data)
   end
   local total = math.max(wanted, current)
 
+  -- Marker for the order overview (kept on the inventory record, so it survives saving).
+  local packageNames = {}
+  for _, pkg in ipairs(type(order.packages) == "table" and order.packages or {}) do
+    table.insert(packageNames, string.format("%s: %s", tostring(pkg.categoryLabel or pkg.category), tostring(pkg.label)))
+  end
+  record.rlsConfiguratorOrder = {
+    name = string.format("%s %s", tostring(info.Brand or ""), tostring(info.Name or info.model_key or "")),
+    config = order.baseConfigName or info.Configuration,
+    preview = info.preview,
+    sellerId = info.sellerId,
+    sellerName = order.sellerName,
+    tierLabel = order.tierLabel,
+    fulfilment = pickup and "pickup" or "garage",
+    deliverySeconds = total,
+    orderedAt = os.time(),
+    price = info.Value,
+    engine = type(order.swap) == "table" and order.swap.engineLabel or nil,
+    packages = packageNames,
+    paint = order.paintName,
+  }
+
   local name = string.format("%s %s", tostring(info.Brand or ""), tostring(info.Name or info.model_key or ""))
   if pickup then
-    ui_message(string.format(T("orderedPickup"), name, tostring(order.tierLabel or ""), tostring(order.sellerName or ""),
+    ui_message(string.format(T(order.localStore and "orderedPickupDealer" or "orderedPickup"), name, tostring(order.tierLabel or ""), tostring(order.sellerName or ""),
       formatDuration(total)), 10, "rlsConfigurator", "info")
   else
     ui_message(string.format(T("ordered"), name, tostring(order.tierLabel or ""), formatDuration(total)),
@@ -1753,6 +2219,145 @@ end
 
 -- Availability is driven from Lua: BeamNG 0.40 routes UI screens through the Lua ui_router, so Lua
 -- knows when the RLS vehicle list is shown and for which seller.
+local pickupCheckTimer = 0
+local pickupSpawning = {}
+
+local function freightSpotFor(sellerId)
+  local dealer = overhaul_world_facilities and safeCall(overhaul_world_facilities.getDealership, sellerId)
+  if not dealer then return nil end
+  local facility = dealer
+  if type(dealer.freightPickupSpotNames) == "table" then
+    facility = deepcopy(dealer)
+    facility.parkingSpotNames = dealer.freightPickupSpotNames
+  end
+  local spots = safeCall(overhaul_world_facilities.getParkingSpotsForFacility, facility) or {}
+  local fallback
+  for _, spot in pairs(spots) do
+    if spot and spot.pos then
+      fallback = fallback or spot
+      local ok, busy = pcall(function() return spot:hasAnyVehicles() end)
+      if ok and not busy then return spot end
+    end
+  end
+  return fallback
+end
+
+-- Order overview ------------------------------------------------------------------------------------
+-- status: production (delivery time running), pickup (ready at the dealer / freight point),
+-- delivered (in a garage or already driven). Open orders first, then the latest delivered ones.
+local function collectOrders()
+  local inv = inventory()
+  local vehicles = inv and safeCall(inv.getVehicles)
+  local open, done = {}, {}
+  if type(vehicles) ~= "table" then return open, done end
+  for inventoryId, record in pairs(vehicles) do
+    local order = type(record) == "table" and record.rlsConfiguratorOrder or nil
+    if type(order) == "table" then
+      local entry = deepcopy(order)
+      entry.inventoryId = inventoryId
+      entry.location = record.niceLocation
+      local remaining = tonumber(record.timeToAccess) or 0
+      if remaining > 0 then
+        entry.status = "production"
+        entry.remaining = remaining
+        entry.remainingText = formatDuration(remaining)
+        local totalTime = math.max(tonumber(order.deliverySeconds) or remaining, remaining)
+        entry.progress = totalTime > 0 and (1 - remaining / totalTime) or 0
+        table.insert(open, entry)
+      elseif record.rlsConfiguratorPickup then
+        entry.status = "pickup"
+        entry.progress = 1
+        table.insert(open, entry)
+      else
+        entry.status = "delivered"
+        entry.progress = 1
+        table.insert(done, entry)
+      end
+    end
+  end
+  table.sort(open, function(a, b) return (a.remaining or 0) < (b.remaining or 0) end)
+  table.sort(done, function(a, b) return (a.orderedAt or 0) > (b.orderedAt or 0) end)
+  return open, done
+end
+
+-- Actions from the order overview for cars waiting at a pickup point:
+--   route  = set a route to the car (or to the pickup spot if it is not spawned yet)
+--   garage = deliver it to a garage instead (garage delivery fee), e.g. if the spot is unreachable
+function M.orderAction(inventoryIdValue, action)
+  local inv = inventory()
+  local inventoryId = tonumber(inventoryIdValue) or inventoryIdValue
+  local vehicles = inv and safeCall(inv.getVehicles)
+  local record = type(vehicles) == "table" and vehicles[inventoryId] or nil
+  local order = type(record) == "table" and record.rlsConfiguratorOrder or nil
+  if not order then
+    logW("orderAction %s: inventory vehicle %s not found", tostring(action), tostring(inventoryIdValue))
+    return M.requestOrders()
+  end
+  local name = tostring(order.name or "")
+  local ok, err = pcall(function()
+    if action == "route" then
+      local pos
+      local vehId = safeCall(inv.getVehicleIdFromInventoryId, inventoryId)
+      local veh = vehId and getObjectByID(vehId)
+      if veh then pos = veh:getPosition() end
+      if not pos and record.rlsConfiguratorPickup then
+        local spot = freightSpotFor(record.rlsConfiguratorPickup.sellerId or order.sellerId)
+        pos = spot and spot.pos
+      end
+      if pos and core_groundMarkers and core_groundMarkers.setPath then
+        core_groundMarkers.setPath(pos)
+        ui_message(string.format(T("routeSet"), name), 6, "rlsConfigurator", "info")
+      else
+        ui_message(T("routeFailed"), 6, "rlsConfigurator", "warning")
+      end
+    elseif action == "garage" then
+      if safeCall(inv.getVehicleIdFromInventoryId, inventoryId) then safeCall(inv.removeVehicleObject, inventoryId) end
+      local moved = safeCall(inv.moveVehicleToGarage, inventoryId, record.freightHomeGarageId)
+      if not moved then
+        ui_message(T("redirectFailed"), 8, "rlsConfigurator", "warning")
+        return
+      end
+      record.rlsConfiguratorPickup = nil
+      record.freightHomeGarageId = nil
+      pickupSpawning[inventoryId] = nil
+      local fee = garageDeliveryFeeFor(tonumber(order.price) or 0)
+      if fee > 0 and overhaul_career_economy_payment and overhaul_career_economy_payment.pay then
+        local tag = {label = "Configurator: delivery to garage", tags = {"delivery"}}
+        local okMeta, metadata = pcall(require, "overhaul/lib/finance/metadata")
+        if okMeta and type(metadata) == "table" and metadata.tag then
+          tag = metadata.tag(tag, "service", {vehicleId = inventoryId})
+        end
+        pcall(overhaul_career_economy_payment.pay, {money = {amount = fee, canBeNegative = true}}, tag)
+      end
+      local delay = 120
+      inv.delayVehicleAccess(inventoryId, delay, "delivery")
+      order.fulfilment = "garage"
+      order.deliverySeconds = delay
+      if core_groundMarkers and core_groundMarkers.setPath then pcall(core_groundMarkers.setPath, nil) end
+      ui_message(string.format(T("redirected"), name, "$" .. tostring(fee), formatDuration(delay)), 8, "rlsConfigurator", "info")
+      logI("order %s redirected from pickup to garage, fee %d", tostring(inventoryId), fee)
+    end
+  end)
+  if not ok then logE("orderAction %s failed: %s", tostring(action), tostring(err)) end
+  M.requestOrders()
+end
+
+function M.requestOrders()
+  local ok, open, done = pcall(collectOrders)
+  if not ok then
+    logE("requestOrders failed: %s", tostring(open))
+    open, done = {}, {}
+  end
+  local limit = tonumber(getSettings().orderHistoryCount) or 8
+  local list = {}
+  for _, entry in ipairs(open) do table.insert(list, entry) end
+  for i, entry in ipairs(done) do
+    if i > limit then break end
+    table.insert(list, entry)
+  end
+  guihooks.trigger("RlsConfiguratorOrders", {lang = getLang(), orders = list, openCount = #open})
+end
+
 local VEHICLE_LIST_STATE = "overhaul.computer.vehicleShopping.vehicles"
 local uiState = nil
 local lastSellerId = nil
@@ -1799,28 +2404,6 @@ end
 
 -- Pickup orders: once the delivery time is over the car is placed on the store's freight point.
 -- State lives in the inventory record (rlsConfiguratorPickup), so it survives saving and loading.
-local pickupCheckTimer = 0
-local pickupSpawning = {}
-
-local function freightSpotFor(sellerId)
-  local dealer = overhaul_world_facilities and safeCall(overhaul_world_facilities.getDealership, sellerId)
-  if not dealer then return nil end
-  local facility = dealer
-  if type(dealer.freightPickupSpotNames) == "table" then
-    facility = deepcopy(dealer)
-    facility.parkingSpotNames = dealer.freightPickupSpotNames
-  end
-  local spots = safeCall(overhaul_world_facilities.getParkingSpotsForFacility, facility) or {}
-  local fallback
-  for _, spot in pairs(spots) do
-    if spot and spot.pos then
-      fallback = fallback or spot
-      local ok, busy = pcall(function() return spot:hasAnyVehicles() end)
-      if ok and not busy then return spot end
-    end
-  end
-  return fallback
-end
 
 local function updatePickups()
   local inv = inventory()
@@ -1846,7 +2429,7 @@ local function updatePickups()
               return
             end
             local name = tostring(record.niceName or record.model or "")
-            ui_message(string.format(T("pickupReady"), name, tostring(pickup.sellerName or "")), 10, "rlsConfigurator", "info")
+            ui_message(string.format(T(pickup.atDealer and "pickupReadyDealer" or "pickupReady"), name, tostring(pickup.sellerName or "")), 10, "rlsConfigurator", "info")
             if core_groundMarkers and core_groundMarkers.setPath then pcall(core_groundMarkers.setPath, spot.pos) end
             logI("pickup ready: inventoryId=%s at %s", tostring(inventoryId), tostring(pickup.sellerId))
           end, {pos = spot.pos, rot = spot.rot})
@@ -1862,6 +2445,10 @@ end
 
 function M.onUiChangedState(toState)
   if toState ~= PURCHASE_STATE then setPurchaseNotice(false) end
+  -- Purchase finished or left: the override was only needed for the checkout itself.
+  if channelOverride and not string.find(tostring(toState or ""), "vehiclePurchase", 1, true) then
+    restoreDealerChannel()
+  end
   uiState = toState
   if toState == VEHICLE_LIST_STATE then
     availabilityCheckPending = true
@@ -1890,11 +2477,12 @@ function M.onUpdate(dtReal)
     -- Teaser data for the card inside the RLS list.
     local fromPrice, configCount, preview = nil, 0, nil
     local tier = getTier(getSettings().defaultDeliveryTier)
+    local surcharge = surchargeFor(shop)
     for _, model in ipairs(shop.models) do
       configCount = configCount + #model.configs
       preview = preview or model.preview
       for _, cfg in ipairs(model.configs) do
-        local price = finalPriceFor(basePriceFor(cfg.catalogValue), tier, extraPctFor(cfg))
+        local price = finalPriceFor(basePriceFor(cfg.catalogValue), tier, extraPctFor(cfg), surcharge)
         fromPrice = fromPrice and math.min(fromPrice, price) or price
       end
     end
@@ -1908,6 +2496,8 @@ function M.onUpdate(dtReal)
       table.insert(names, model.name)
     end
     payload.modelNames = table.concat(names, ", ") .. (#shop.models > 4 and " …" or "")
+    local okOrders, openOrders = pcall(collectOrders)
+    payload.openOrders = okOrders and type(openOrders) == "table" and #openOrders or 0
   end
   guihooks.trigger("RlsConfiguratorAvailability", payload)
 end
@@ -1917,15 +2507,26 @@ function M.onOverhaulVehicleShoppingSelectedSellerIdChanged(sellerId)
   lastSellerId = sellerId
   local removed = removeConfiguratorListings(nil)
   if removed > 0 then logI("removed %d unfinished configurator listing(s)", removed) end
+  restoreDealerChannel()
   armedPaint = nil
   if uiState == VEHICLE_LIST_STATE then availabilityCheckPending = true end
   if not sellerId then hideAvailability() end
+end
+
+-- Dealer ids repeat across maps (e.g. ETKDealership on West Coast and Italy): rebuild per level.
+function M.onClientStartMission()
+  shopIndex = nil
+  shopIndexLevel = nil
+  compatCache = {}
+  swapQuoteCache = {}
+  packageCache = {}
 end
 
 function M.onModActivated()
   shopIndex = nil
   compatCache = {}
   swapQuoteCache = {}
+  packageCache = {}
 end
 M.onModDeactivated = M.onModActivated
 
@@ -1936,6 +2537,7 @@ function M.onExtensionLoaded()
 end
 
 function M.onExtensionUnloaded()
+  restoreDealerChannel()
   uninstallSpawnWrapper()
 end
 

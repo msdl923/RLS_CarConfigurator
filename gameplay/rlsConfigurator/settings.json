@@ -15,6 +15,12 @@
   "_shops": "Brand factory stores are detected automatically on every map. Use these lists to add or exclude shop ids.",
   "extraConfiguratorShops": [],
   "excludedConfiguratorShops": [],
+  "_localBrandStores": "Brand stores sold through a normal dealer lot (e.g. the Online Dealerships on RLS Italy, brand in subFilters) also get the configurator when they only sell new cars (max mileage in metres <= brandStoreMaxMileage) or their id/name contains one of brandStoreNamePatterns.",
+  "detectLocalBrandStores": true,
+  "brandStoreMaxMileage": 160934,
+  "brandStoreNamePatterns": ["online"],
+  "_localStoresAsOnline": "true = during a configurator checkout a local brand store is treated like an online store (remote checkout, pickup at its parking spot). Needed on RLS Italy, whose online dealerships have no door on the map.",
+  "localStoresAsOnline": true,
   "allowedVehicleTypes": ["Car", "Truck"],
   "excludedModels": [],
   "excludedConfigPatterns": ["^rls_", "^npk_", "^sk_", "joes_junk", "used_and_abused", "noprep", "streetheat", "proturbo"],
@@ -63,6 +69,22 @@
   "garageDeliveryFeePct": 1,
   "garageDeliveryFeeMin": 250,
   "garageDeliveryFeeMax": 2500,
+
+  "_reputation": "Dealer reputation (RLS organisation level) lowers the configurator surcharge: minimum level -> percentage points off configuratorSurchargePct.",
+  "reputationSurchargeReduction": { "2": 2, "3": 4, "4": 6 },
+
+  "_packages": "Equipment packages: wheels/suspension taken from another variant of the same model line. Price = part value difference (downgrades refund packageRefundPct). slotPatterns are matched against slot names (lower case, substring).",
+  "packagesEnabled": true,
+  "packageRefundPct": 50,
+  "packageCategories": [
+    { "id": "wheels", "label": { "de": "Felgen & Reifen", "en": "Wheels & tyres" },
+      "slotPatterns": ["wheel_f", "wheel_r", "spacer_f", "spacer_r"] },
+    { "id": "suspension", "label": { "de": "Fahrwerk", "en": "Suspension" },
+      "slotPatterns": ["coilover", "spring_f", "spring_r", "shock_f", "shock_r", "swaybar", "strut_f", "strut_r", "damper"] }
+  ],
+
+  "_orders": "Order overview: number of delivered orders shown below the open ones.",
+  "orderHistoryCount": 8,
 
   "shopOverrides": {
     "_example": { "includeModels": [], "excludeModels": [] }
